@@ -2,12 +2,19 @@
 """
 probe_ech.py — ECH 部署探测器（修复版）
 
-主要修复：
+修复记录：
   1. ClientHello 补全 supported_groups + signature_algorithms 扩展
-     （缺这两个扩展，服务器会直接发 alert，而不是 HRR）
   2. socket 读取改为按 TLS 记录头读完整记录，不再截断
   3. HRR 解析中 ECHConfigList 偏移计算修正
   4. 伪 ECH 格式更贴近草案规范
+
+  v2 额外修复：
+  A. fake_ech cipher_suite 字段错误：应为 (kdf_id, aead_id)，原代码写成了
+     (kem_id=0x0020, aead_id)，会导致服务器拒绝记录而非回 HRR。
+     修正为 (KDF=HKDF-SHA256=0x0001, AEAD=AES-128-GCM=0x0001)。
+  B. read_tls_records 收到 ChangeCipherSpec (rec_type=0x14) 时没有 break，
+     导致每次碰到支持 ECH 的服务器都必须等完整个 timeout。
+     修正：增加 `if rec_type == 0x14: break`。
 """
 
 import argparse
@@ -27,11 +34,12 @@ from typing import Optional
 # ── TLS 常量 ─────────────────────────────────────────────────────────────────
 
 TLS_RECORD_HANDSHAKE       = 0x16
+TLS_RECORD_CCS             = 0x14   # ChangeCipherSpec
 TLS_HS_CLIENT_HELLO        = 0x01
 TLS_HS_SERVER_HELLO        = 0x02
 TLS_EXT_SNI                = 0x0000
-TLS_EXT_SUPPORTED_GROUPS   = 0x000A   # ← 之前版本缺少，必须有
-TLS_EXT_SIG_ALGS           = 0x000D   # ← 之前版本缺少，必须有
+TLS_EXT_SUPPORTED_GROUPS   = 0x000A
+TLS_EXT_SIG_ALGS           = 0x000D
 TLS_EXT_KEY_SHARE          = 0x0033
 TLS_EXT_SUPPORTED_VERSIONS = 0x002B
 TLS_EXT_ECH                = 0xFE0D
@@ -64,9 +72,6 @@ def build_client_hello(sni: str) -> bytes:
     """
     构造完整 TLS 1.3 ClientHello，携带故意无效的 ECH 扩展。
     服务器无法解密 ECH → 按规范必须回复 HelloRetryRequest（含真实 ECH 配置）。
-
-    必须包含的扩展（缺少任意一个，服务器会发 alert 而非 HRR）：
-      SNI / supported_versions / supported_groups / signature_algorithms / key_share / ECH
     """
 
     # SNI
@@ -98,13 +103,14 @@ def build_client_hello(sni: str) -> bytes:
     ks_ext = ext(TLS_EXT_KEY_SHARE, vec16(ks_entry))
 
     # 伪 ECH（draft-ietf-tls-esni-24 §5 格式）
-    # type=outer(0) + cipher_suite(4) + config_id=0xFF(不存在) + enc + payload
-    # config_id=0xFF 几乎不可能存在于服务器，触发 HRR
+    # HpkeSymmetricCipherSuite = (kdf_id, aead_id)，不含 kem_id。
+    # 修复：原代码误用 kem_id=0x0020；正确值为
+    #   KDF=HKDF-SHA256=0x0001, AEAD=AES-128-GCM=0x0001
     fake_ech = (
         b"\x00"
-        + struct.pack("!HH", 0x0020, 0x0001)   # KEM=DHKEM(X25519), AEAD=AES-128-GCM
-        + b"\xFF"                               # config_id (不存在)
-        + vec16(os.urandom(32))                 # enc
+        + struct.pack("!HH", 0x0001, 0x0001)   # KDF=HKDF-SHA256, AEAD=AES-128-GCM
+        + b"\xFF"                               # config_id (不存在，触发 HRR)
+        + vec16(os.urandom(32))                 # enc  (X25519 公钥大小)
         + vec16(os.urandom(128))                # payload
     )
     ech_ext = ext(TLS_EXT_ECH, fake_ech)
@@ -132,8 +138,12 @@ def build_client_hello(sni: str) -> bytes:
 
 async def read_tls_records(reader: asyncio.StreamReader, timeout: float) -> bytes:
     """
-    之前版本读到 512 字节就 break，会截断跨多个 TCP 段的 HRR 响应。
-    现在改为按记录头（5字节）逐条读取完整记录。
+    按记录头（5字节）逐条读取完整 TLS 记录。
+
+    修复：原来收到 ChangeCipherSpec (rec_type=0x14) 时没有 break，
+    导致每次探测支持 ECH 的服务器都要等满整个 timeout。
+    HRR 之后服务器会发 CCS 然后等待客户端的第二个 ClientHello，
+    收到 CCS 即可停止读取。
     """
     buf = b""
     deadline = time.monotonic() + timeout
@@ -160,12 +170,23 @@ async def read_tls_records(reader: asyncio.StreamReader, timeout: float) -> byte
             # Alert → 停止
             if rec_type == 0x15:
                 break
-            # 握手记录：收到 ServerHello 后再多读一条，其他类型停止
+
+            # ChangeCipherSpec → 服务器在等我们的第二个 ClientHello，停止读取
+            # 修复：原来缺少此分支，导致每次都要等满 timeout
+            if rec_type == TLS_RECORD_CCS:
+                break
+
+            # 握手记录
             if rec_type == TLS_RECORD_HANDSHAKE and body:
                 if body[0] == TLS_HS_SERVER_HELLO:
+                    # 可能是 HRR，继续读 CCS
                     continue
                 if body[0] in (0x08, 0x0B, 0x0F, 0x14):
+                    # EncryptedExtensions / Certificate / CertificateVerify / Finished
                     break
+                # 其他握手消息类型也停止，避免无限等待
+                break
+
     except Exception:
         pass
     return buf
