@@ -6,7 +6,7 @@ on:
       domains:
         description: "域名列表（逗号分隔，或留空使用内置样本）"
         required: false
-        default: ""
+        default: "v2ex.com,meta.com"
       concurrency:
         description: "并发探测数量"
         required: false
@@ -69,9 +69,12 @@ jobs:
           make -j$(nproc)
           make install_sw
 
-      - name: 保存编译产物到缓存
+      # 修复：原来有两个 actions/cache@v4 步骤使用相同的 key。
+      # actions/cache@v4 在 cache miss 时会在 job 结束后自动保存，
+      # 重复的显式 save 步骤是多余的，应改用 actions/cache/save@v4。
+      - name: 显式保存编译产物到缓存
         if: steps.cache.outputs.cache-hit != 'true'
-        uses: actions/cache@v4
+        uses: actions/cache/save@v4
         with:
           path: ~/openssl-ech
           key: openssl-ech-${{ steps.ech-rev.outputs.rev }}-ubuntu22
