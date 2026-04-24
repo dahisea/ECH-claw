@@ -1,0 +1,175 @@
+name: ECH Scanner
+
+on:
+  # 手动触发，支持自定义参数
+  workflow_dispatch:
+    inputs:
+      domains_file:
+        description: '域名列表文件路径（相对于仓库根目录）'
+        required: false
+        default: 'domains.txt'
+      concurrency:
+        description: '并发数'
+        required: false
+        default: '30'
+      timeout:
+        description: '每域名超时（秒）'
+        required: false
+        default: '8'
+
+  # 定时任务：每天 UTC 02:00 自动运行
+  schedule:
+    - cron: '0 2 * * *'
+
+  # PR / push 时对默认域名列表做冒烟测试
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'domains.txt'
+      - 'probe_ech.go'
+      - '.github/workflows/ech-scan.yml'
+  pull_request:
+    branches: [ main, master ]
+
+concurrency:
+  group: ech-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    name: ECH Probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    permissions:
+      contents: write   # 用于将结果推送到 results 分支
+      actions: read
+
+    steps:
+      # ── 1. 检出代码 ────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 拉取全部历史，供 results 分支推送使用
+
+      # ── 2. 设置 Go 环境 ───────────────────────────────────────────────────
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      # ── 3. 编译 ──────────────────────────────────────────────────────────
+      - name: Build probe_ech
+        run: |
+          go build -v -trimpath -ldflags="-s -w" -o probe_ech ./probe_ech.go
+          echo "Binary size: $(du -sh probe_ech | cut -f1)"
+
+      # ── 4. 确定运行参数 ───────────────────────────────────────────────────
+      - name: Resolve parameters
+        id: params
+        run: |
+          DOMAINS="${{ github.event.inputs.domains_file || 'domains.txt' }}"
+          CONC="${{ github.event.inputs.concurrency || '30' }}"
+          TOUT="${{ github.event.inputs.timeout || '8' }}"
+          echo "domains=$DOMAINS"   >> "$GITHUB_OUTPUT"
+          echo "concurrency=$CONC" >> "$GITHUB_OUTPUT"
+          echo "timeout=$TOUT"     >> "$GITHUB_OUTPUT"
+          echo "### 扫描参数" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 参数 | 值 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 域名列表 | \`$DOMAINS\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 总域名数 | $(grep -cv '^\s*#\|^\s*$' "$DOMAINS" || echo 0) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 并发数 | $CONC |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 超时 | ${TOUT}s |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 触发方式 | ${{ github.event_name }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+      # ── 5. 运行扫描 ──────────────────────────────────────────────────────
+      - name: Run ECH scan
+        run: |
+          mkdir -p results
+          ./probe_ech \
+            --domains "${{ steps.params.outputs.domains }}" \
+            --concurrency "${{ steps.params.outputs.concurrency }}" \
+            --timeout "${{ steps.params.outputs.timeout }}" \
+            --output results/
+
+      # ── 6. 生成带时间戳的快照 ───────────────────────────────────────────
+      - name: Timestamp results
+        run: |
+          TS=$(date -u +%Y%m%dT%H%M%SZ)
+          echo "timestamp=$TS" >> "$GITHUB_ENV"
+          cp results/results.json "results/results_${TS}.json"
+          cp results/results.csv  "results/results_${TS}.csv"
+          cp results/summary.txt  "results/summary_${TS}.txt"
+
+      # ── 7. 上传 Artifact ─────────────────────────────────────────────────
+      - name: Upload scan artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ech-scan-${{ env.timestamp }}
+          path: results/
+          retention-days: 90
+          if-no-files-found: error
+
+      # ── 8. 将结果推送到 results 分支（仅 main / 定时触发）──────────────
+      - name: Push results to branch
+        if: |
+          github.event_name == 'schedule' ||
+          (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')) ||
+          github.event_name == 'workflow_dispatch'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 切换到（或新建）results 分支
+          git fetch origin results 2>/dev/null && \
+            git checkout results || \
+            git checkout --orphan results
+
+          # 只保留 results/ 目录
+          git rm -rf . --quiet 2>/dev/null || true
+          mkdir -p results
+
+          # 从主分支的 workspace 拷贝结果
+          ORIG_RESULTS="${GITHUB_WORKSPACE}/results"
+          if [ -d "$ORIG_RESULTS" ]; then
+            cp "$ORIG_RESULTS"/* results/ 2>/dev/null || true
+          fi
+
+          # 写入 README
+          cat > README.md << 'EOF'
+          # ECH 扫描结果存档
+
+          此分支由 GitHub Actions 自动维护，存储每次扫描的 JSON / CSV / TXT 结果。
+
+          | 文件 | 说明 |
+          |---|---|
+          | `results/results.json` | 最新完整结果（JSON） |
+          | `results/results.csv`  | 最新完整结果（CSV） |
+          | `results/summary.txt`  | 最新摘要文本 |
+          | `results/results_<TS>.json` | 历史快照 |
+          EOF
+
+          git add -A
+          git diff --cached --quiet || \
+            git commit -m "scan: ${{ env.timestamp }} [${{ github.event_name }}]"
+          git push origin results
+
+      # ── 9. 打印摘要到控制台 ──────────────────────────────────────────────
+      - name: Print summary
+        if: always()
+        run: |
+          echo ""
+          cat results/summary.txt 2>/dev/null || echo "（无摘要文件）"
+
+      # ── 10. 失败时上传 debug 日志 ─────────────────────────────────────
+      - name: Upload debug on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-${{ env.timestamp }}
+          path: |
+            results/
+          retention-days: 7
