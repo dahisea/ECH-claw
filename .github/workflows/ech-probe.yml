@@ -1,12 +1,21 @@
 name: ECH Deployment Probe
 
+# 修复说明（yml）：
+#   1. 去掉缓存：将 build-openssl 与 probe 合并为单个 job，
+#      消除两 job 间通过 actions/cache 传递产物的复杂性与不稳定性。
+#   2. 修正脚本路径：原来 `python scripts/probe_ech.py` 路径不存在，
+#      改为 `python probe_ech.py`（文件位于仓库根目录）。
+#   3. 移除无用依赖：`aiofiles` 和 `dnspython` 在代码中从未使用，
+#      pip install 步骤已删除，节省约 10–15s 安装时间。
+#   4. 默认域名列表新增 v2ex.com、meta.com；github.com 原已存在。
+
 on:
   workflow_dispatch:
     inputs:
       domains:
         description: "域名列表（逗号分隔，或留空使用内置样本）"
         required: false
-        default: "v2ex.com,meta.com"
+        default: ""
       concurrency:
         description: "并发探测数量"
         required: false
@@ -20,96 +29,38 @@ on:
     - cron: "0 2 * * *"
 
 jobs:
-  # ─────────────────────────────────────────────
-  # Job 1: 构建 OpenSSL ECH 分支（带缓存）
-  # ─────────────────────────────────────────────
-  build-openssl:
-    name: Build OpenSSL (feature/ech)
+  # 修复 1：合并为单 job，彻底去掉缓存，编译完直接探测
+  probe:
+    name: Build OpenSSL & Probe ECH
     runs-on: ubuntu-22.04
-    outputs:
-      cache-hit: ${{ steps.cache.outputs.cache-hit }}
 
     steps:
       - name: 检出本仓库
         uses: actions/checkout@v4
 
-      # 用 OpenSSL 源码的最新 commit hash 作为缓存键，避免重复编译
-      - name: 获取 OpenSSL ECH 分支最新 commit
-        id: ech-rev
-        run: |
-          REV=$(git ls-remote https://github.com/openssl/openssl.git refs/heads/feature/ech | cut -f1)
-          echo "rev=$REV" >> $GITHUB_OUTPUT
-
-      - name: 恢复 OpenSSL 编译缓存
-        id: cache
-        uses: actions/cache@v4
-        with:
-          path: ~/openssl-ech
-          key: openssl-ech-${{ steps.ech-rev.outputs.rev }}-ubuntu22
-
       - name: 安装编译依赖
-        if: steps.cache.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             build-essential git perl libssl-dev
 
-      - name: 克隆 OpenSSL feature/ech
-        if: steps.cache.outputs.cache-hit != 'true'
+      - name: 克隆 OpenSSL feature/ech 并编译
         run: |
           git clone --depth=1 --branch feature/ech \
             https://github.com/openssl/openssl.git ~/openssl-src
-
-      - name: 编译 OpenSSL
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: |
           cd ~/openssl-src
           ./Configure --prefix=$HOME/openssl-ech --openssldir=$HOME/openssl-ech \
             no-shared linux-x86_64
           make -j$(nproc)
           make install_sw
 
-      # 修复：原来有两个 actions/cache@v4 步骤使用相同的 key。
-      # actions/cache@v4 在 cache miss 时会在 job 结束后自动保存，
-      # 重复的显式 save 步骤是多余的，应改用 actions/cache/save@v4。
-      - name: 显式保存编译产物到缓存
-        if: steps.cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: ~/openssl-ech
-          key: openssl-ech-${{ steps.ech-rev.outputs.rev }}-ubuntu22
-
-  # ─────────────────────────────────────────────
-  # Job 2: 探测 ECH
-  # ─────────────────────────────────────────────
-  probe:
-    name: Probe ECH Deployments
-    runs-on: ubuntu-22.04
-    needs: build-openssl
-
-    steps:
-      - name: 检出本仓库
-        uses: actions/checkout@v4
-
-      - name: 获取 OpenSSL ECH 分支最新 commit（复用缓存键）
-        id: ech-rev
-        run: |
-          REV=$(git ls-remote https://github.com/openssl/openssl.git refs/heads/feature/ech | cut -f1)
-          echo "rev=$REV" >> $GITHUB_OUTPUT
-
-      - name: 恢复 OpenSSL 编译缓存
-        uses: actions/cache@v4
-        with:
-          path: ~/openssl-ech
-          key: openssl-ech-${{ steps.ech-rev.outputs.rev }}-ubuntu22
-
       - name: 设置 Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: 安装 Python 依赖
-        run: pip install aiofiles dnspython
+      # 修复 3：移除从未使用的 aiofiles / dnspython
+      # （probe_ech.py 仅用标准库，无需额外安装）
 
       - name: 准备域名列表
         run: |
@@ -120,7 +71,7 @@ jobs:
               | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
               | grep -v '^$' > domains.txt
           else
-            # 使用内置样本（包含已知 ECH 部署和普通域名对比）
+            # 修复 4：内置样本新增 v2ex.com、meta.com；github.com 原已存在
             cat <<'EOF' > domains.txt
           cloudflare.com
           blog.cloudflare.com
@@ -129,8 +80,10 @@ jobs:
           instagram.com
           whatsapp.com
           messenger.com
+          meta.com
           google.com
           github.com
+          v2ex.com
           example.com
           tls-ech.dev
           defo.ie
@@ -139,9 +92,10 @@ jobs:
           echo "待探测域名数量: $(wc -l < domains.txt)"
           cat domains.txt
 
+      # 修复 2：脚本路径由 scripts/probe_ech.py 改为 probe_ech.py
       - name: 执行 ECH 探测
         run: |
-          python scripts/probe_ech.py \
+          python probe_ech.py \
             --domains domains.txt \
             --openssl ~/openssl-ech/bin/openssl \
             --concurrency ${{ github.event.inputs.concurrency || '20' }} \
