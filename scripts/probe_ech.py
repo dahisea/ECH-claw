@@ -15,6 +15,12 @@ probe_ech.py — ECH 部署探测器（修复版）
   B. read_tls_records 收到 ChangeCipherSpec (rec_type=0x14) 时没有 break，
      导致每次碰到支持 ECH 的服务器都必须等完整个 timeout。
      修正：增加 `if rec_type == 0x14: break`。
+
+  v3 额外修复：
+  C. probe_domain 接受并传递 loop 参数已废弃（Python 3.10+），
+     改为在函数内部通过 asyncio.get_running_loop() 获取。
+  D. main() 中 asyncio.get_event_loop() 在异步上下文内已废弃，已移除。
+  E. CSV 写入前增加空结果守卫，避免 results[0] IndexError。
 """
 
 import argparse
@@ -323,8 +329,9 @@ class ProbeResult:
 
 async def probe_domain(
     domain: str, openssl_bin: str,
-    timeout: float, loop: asyncio.AbstractEventLoop,
+    timeout: float,
 ) -> ProbeResult:
+    # 修复 C/D：移除废弃的 loop 参数，在函数内部获取正在运行的事件循环
     res = ProbeResult(domain=domain)
 
     try:
@@ -357,6 +364,8 @@ async def probe_domain(
     res.ech_config_b64  = configs[0]["raw_b64"]
 
     if os.path.isfile(openssl_bin):
+        # 修复 C：使用 get_running_loop() 代替废弃的 get_event_loop()
+        loop = asyncio.get_running_loop()
         ok, lat_ech = await loop.run_in_executor(
             None, openssl_connect, openssl_bin, domain, res.ech_config_b64, timeout)
         _, lat_plain = await loop.run_in_executor(
@@ -379,12 +388,18 @@ async def main(args):
                if l.strip() and not l.startswith("#")]
     print(f"[*] {len(domains)} 个域名，并发={args.concurrency}，超时={args.timeout}s\n")
 
-    sem  = asyncio.Semaphore(args.concurrency)
-    loop = asyncio.get_event_loop()
+    # 修复 E：空域名列表直接退出，避免后续 results[0] IndexError
+    if not domains:
+        print("[!] 域名列表为空，退出。")
+        return
+
+    sem = asyncio.Semaphore(args.concurrency)
+    # 修复 D：移除废弃的 asyncio.get_event_loop()，loop 已在 probe_domain 内部获取
 
     async def run(d):
         async with sem:
-            r = await probe_domain(d, args.openssl, args.timeout, loop)
+            # 修复 C/D：不再传递 loop 参数
+            r = await probe_domain(d, args.openssl, args.timeout)
             tag   = "✓ ECH" if r.supports_ech else ("✗ err" if r.error else "✗ none")
             pub   = f" → {r.ech_public_name}" if r.ech_public_name else ""
             delta = f" Δ{r.latency_delta_ms:+.1f}ms" if r.latency_delta_ms is not None else ""
@@ -396,6 +411,7 @@ async def main(args):
     (out/"results.json").write_text(
         json.dumps([asdict(r) for r in results], indent=2, ensure_ascii=False))
 
+    # 修复 E：results 非空已由上方守卫保证，此处安全访问 results[0]
     with open(out/"results.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(asdict(results[0]).keys()))
         w.writeheader(); w.writerows([asdict(r) for r in results])
