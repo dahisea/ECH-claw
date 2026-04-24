@@ -1,0 +1,67 @@
+# ECH 探测域名列表
+# 每行一个域名，# 开头为注释，空行忽略
+
+# ── Cloudflare ──
+cloudflare.com
+dash.cloudflare.com
+blog.cloudflare.com
+workers.cloudflare.com
+1.1.1.1
+speed.cloudflare.com
+
+# ── Meta / Facebook ──
+facebook.com
+instagram.com
+whatsapp.com
+
+# ── Google ──
+google.com
+youtube.com
+gmail.com
+drive.google.com
+
+# ── Fastly / CDN ──
+fastly.com
+github.com
+github.io
+
+# ── Brave ──
+brave.com
+search.brave.com
+
+# ── Mozilla ──
+mozilla.org
+firefox.com
+
+# ── Wikimedia ──
+wikipedia.org
+wikimedia.org
+
+# ── Apple ──
+apple.com
+icloud.com
+
+# ── Microsoft ──
+microsoft.com
+azure.com
+
+# ── Amazon ──
+amazon.com
+aws.amazon.com
+
+# ── Twitter / X ──
+x.com
+twitter.com
+
+# ── Misc ──
+duckduckgo.com
+proton.me
+tuta.com
+signal.org
+discord.com
+zoom.us
+slack.com
+notion.so
+linear.app
+vercel.com
+netlify.com
